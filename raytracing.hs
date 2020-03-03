@@ -9,6 +9,8 @@ import Data.List (sortOn)
 import Codec.Picture
 import Debug.Trace
 import Text.Printf (printf)
+import System.Random
+import Data.List.Split
 
 type PointInt = (Int, Int)
 type PointFloat = (Float, Float)
@@ -30,12 +32,6 @@ data Object = Sphere {center :: Position, radius :: Float}
               | Plane {planeP :: Position, planeNorm :: Direction, doubleSide :: Bool}
               | Triangle {p0 :: Position, p1 :: Position, p2 :: Position, doubleSide :: Bool}
               | CompositeTriangle {vertex :: [Position], vertexIndex :: [Int]}
-              | CheckerBoard { boardP :: Position
-                             , boardNorm :: Direction
-                             , doubleSide :: Bool
-                             , material1 :: Material
-                             , material2 :: Material
-                             , cellSize :: Float}
               deriving (Eq, Show)
 
 data Material = Material { color        :: Color
@@ -43,7 +39,10 @@ data Material = Material { color        :: Color
                          , reflectivity :: Float
                          , ior          :: Float
                          , transmission :: Float
-                         } deriving (Eq, Show)
+                         }
+                | Checker { material0 :: Material
+                          , material1 :: Material
+                          , cellSize :: (Float, Float)} deriving (Eq, Show)
 
 data Transformation = Rotate { axis :: Axis, degree :: Float }
                     | Translate { movement :: (V3 Float) }
@@ -51,25 +50,27 @@ data Transformation = Rotate { axis :: Axis, degree :: Float }
 
 data Light = Light { lightPos :: Position, brightness :: Float, lightColor :: Color}
 
-data Camera = Camera { cameraPos :: Position
-                     , focalLength :: Float
+data Camera = Camera { focalLength :: Float
                      , cameraAperture :: PointFloat
                      , imageSize :: PointInt
-                     , aaFactor :: Int
+                     , aaPoints :: [(Float, Float)]
                      }
 
+data View = Perspective | Orthogonal
 
 data Scene = Scene { camera :: Transformed Camera
                    , objectList :: [Transformed ShadedObject]
                    , lightList :: [Light]
                    , defaultColor :: Color
                    , ambientLight :: Light
+                   , view :: View
                    }
 
 data ShadedObject = ShadedObject { shadeObj :: Object, material :: Material } deriving (Eq, Show)
-data Transformed a = Transformed { transformObj :: a, matrix :: Matrix44} deriving (Eq)
+data Transformed a = Transformed { transformObj :: a, matrix :: Matrix44, invmat :: Matrix44} deriving (Eq)
 
 
+-- object intersect
 intersectComposite :: Ray -> Material -> [Position] -> [Int] -> Maybe Hit
 intersectComposite ray material points links
     | distanceList == [] = Nothing
@@ -80,11 +81,8 @@ intersectComposite ray material points links
           calcDistance [] = []
           calcDistance (Nothing:xs) = calcDistance xs
           calcDistance (Just x:xs) = (lengthVec (origin ray - hitPoint x), Just x):calcDistance xs
-
-
-generateTriangles :: [Position] -> [Int] -> [Object]
-generateTriangles xs [] = []
-generateTriangles xs (a:b:c:ys) = (Triangle (xs !! a) (xs !! b) (xs !! c) False):generateTriangles xs ys
+          generateTriangles xs [] = []
+          generateTriangles xs (a:b:c:ys) = (Triangle (xs !! a) (xs !! b) (xs !! c) False):generateTriangles xs ys
 
 
 intersectTriangle :: Ray -> Material -> Object -> Maybe Hit
@@ -110,11 +108,11 @@ intersectTriangle (Ray rayorig raydir) material (Triangle a b c double)
 
 
 intersectSphere :: Ray -> Material -> Object -> Maybe Hit
-intersectSphere (Ray rayorig raydir) material (Sphere center radius)
+intersectSphere (Ray rayorig raydir) material s@(Sphere center radius)
     | tca < 0 = Nothing
     | d2 > radius2 = Nothing
     | t0 < 0 && t1 < 0 = Nothing
-    | otherwise = Just $ Hit pHit pNorm (ShadedObject (Sphere center radius) material)
+    | otherwise = Just $ Hit pHit pNorm (ShadedObject (Sphere center radius) mat)
     where l = center - rayorig
           tca = dot l raydir
           d2 = (dot l l) - tca * tca
@@ -124,45 +122,20 @@ intersectSphere (Ray rayorig raydir) material (Sphere center radius)
           t1 = tca + thc
           pHit = if t0 < 0 then rayorig + (raydir ^* t1) else rayorig + (raydir ^* t0)
           pNorm = normalize (pHit - center)
+          mat = getMaterial s pHit material
 
 
 intersectPlane :: Ray -> Material -> Object -> Maybe Hit
-intersectPlane (Ray rayorig raydir) material (Plane point norm doubleSide)
+intersectPlane (Ray rayorig raydir) material plane@(Plane point norm doubleSide)
     | nDotRay > 0 && (not doubleSide) = Nothing
     | abs nDotRay < 0.001 = Nothing
     | t < 0 = Nothing
-    | otherwise = Just $ Hit p normal (ShadedObject (Plane point normal doubleSide) material)
+    | otherwise = Just $ Hit p normal (ShadedObject (Plane point normal doubleSide) mat)
     where normal = normalize norm
           nDotRay = dot normal raydir
           t = (dot (point - rayorig) normal) / nDotRay
           p = rayorig ^+^ t *^ raydir
-
-
-intersectChecker :: Ray -> Object -> Maybe Hit
-intersectChecker (Ray rayorig raydir) board@(CheckerBoard point norm doubleSide material1 material2 cellSize)
-    | nDotRay > 0 && (not doubleSide) = Nothing
-    | abs nDotRay < 0.001 = Nothing
-    | t < 0 = Nothing
-    | d /= e = Just $ Hit p normal (ShadedObject board material1)
-    | otherwise = Just $ Hit p normal (ShadedObject board material2)
-    where normal = normalize norm
-          nDotRay = dot normal raydir
-          t = (dot (point - rayorig) normal) / nDotRay
-          p@(V3 a b c) = rayorig ^+^ t *^ raydir
-          point2dx = dot (p - point) x
-          point2dy = dot (p - point) y
-          d = even (floor $ point2dx / cellSize)
-          e = even (floor $ point2dy / cellSize)
-          (x, y) = arbitaryXY board
-
-
-arbitaryXY :: Object -> (Position, Position)
-arbitaryXY (CheckerBoard point norm _ _ _ _) = (x, y)
-    where n = normalize norm
-          u = if n == V3 1 0 0 then V3 0 1 0 else V3 1 0 0
-          un = dot u n
-          x = normalize (u - un *^ n)
-          y = normalize (cross n x)
+          mat = getMaterial plane p material
 
 
 intersect :: Ray -> Material -> Object -> Maybe Hit
@@ -170,45 +143,122 @@ intersect ray material a@(Sphere _ _) = intersectSphere ray material a
 intersect ray material a@(Plane _ _ _) = intersectPlane ray material a
 intersect ray material a@(Triangle _ _ _ _) = intersectTriangle ray material a
 intersect ray material (CompositeTriangle points indexes) = intersectComposite ray material points indexes
-intersect ray _ a@(CheckerBoard _ _ _ _ _ _) = intersectChecker ray a
 
 
-generateEyeRay :: Transformed Camera -> PointInt -> Ray
-generateEyeRay (Transformed camera matrix) (x, y) = Ray transformedOrigin (normalize transformedEyeray)
+
+-- material
+getMaterial :: Object -> Position -> Material -> Material
+getMaterial _ _ m@(Material _ _ _ _ _) = m
+getMaterial p@(Plane point normal _) hitP (Checker mat1 mat2 (cellX, cellY))
+    | d /= e = mat1
+    | otherwise = mat2
+    where (x, y) = arbitaryAxis normal
+          point2dx = dot (hitP - point) x
+          point2dy = dot (hitP - point) y
+          d = even (floor $ point2dx / cellX)
+          e = even (floor $ point2dy / cellY)
+
+getMaterial s@(Sphere _ r) hitP (Checker mat1 mat2 (cX, cY))
+    | even (u2 + v2) = mat1
+    | otherwise = mat2
+    where (u, v) = spericalMap s hitP
+          cellX = fromIntegral $ floor $ 2 * r * pi / cX
+          cellY = fromIntegral $ floor $ 2 * r / cY
+          u2 = floor $ cellX * u
+          v2 = floor $ cellY * v
+
+
+spericalMap :: Object -> Position -> (Float, Float)
+spericalMap (Sphere origin radius) hitP = (u, v)
+    where (V3 x y z) = hitP - origin
+          theta = atan2 x z
+          phi = acos (y / radius)
+          rawU = theta / (2 * pi)
+          u = 1 - (rawU + 0.5)
+          v = 1 - (phi / pi)
+
+
+-- camera & generate rays
+generateEyeRay :: Transformed Camera -> PointFloat -> Ray
+generateEyeRay (Transformed camera matrix _) (x, y) = Ray transformedOrigin (normalize transformedEyeray)
     where (x', y') = pointTo3Dpoint camera (x, y)
           eyeray = V3 x' y' (-focalLength camera)
           transformedEyeray = transformDir matrix eyeray
-          transformedOrigin = transformPos matrix (cameraPos camera)
+          transformedOrigin = transformPos matrix (V3 0 0 0)
 
 
 generateEyeRays :: Transformed Camera -> PointInt -> [Ray]
-generateEyeRays c@(Transformed camera matrix) (x, y) = map (generateEyeRay c) points
-    where points = generatePoints (x, y) (aaFactor camera)
+generateEyeRays c@(Transformed camera matrix _) (x, y) = map (generateEyeRay c) points
+    where points = generatePoints (x, y) (aaPoints camera)
 
 
-generatePoints :: PointInt -> Int -> [PointInt]
-generatePoints (x, y) n = [(a, b) | a <- xs, b <- ys]
-    where xs = map (+(n*x)) [0..(n-1)]
-          ys = map (+(n*y)) [0..(n-1)]
+generatePoints :: PointInt -> [PointFloat] -> [PointFloat]
+generatePoints (x, y) zs = [(x' + a, y' + b) | (a, b) <- zs]
+    where x' = fromIntegral x
+          y' = fromIntegral y
 
 
-pointTo3Dpoint :: Camera -> PointInt -> PointFloat
+pointTo3Dpoint :: Camera -> PointFloat -> PointFloat
 pointTo3Dpoint camera (x, y) = (pixelScreenx * filmWidth / 2.0, pixelScreeny * filmHeight / 2.0)
-    where (pixelNDCx, pixelNDCy) = calcNDCpoints (x, y) (imageSize camera) (aaFactor camera)
+    where (pixelNDCx, pixelNDCy) = calcNDCpoints (x, y) (imageSize camera)
           pixelScreenx = 2 * pixelNDCx - 1
           pixelScreeny = 2 * pixelNDCy - 1
           (filmWidth, filmHeight) = cameraAperture camera
 
 
-calcNDCpoints :: PointInt -> PointInt -> Int -> PointFloat
-calcNDCpoints (x, y) (w, h) a = (pixelNDCx, pixelNDCy)
-    where pixelNDCx = (fromIntegral x + 0.5) / (fromIntegral virtualw)
-          pixelNDCy = (fromIntegral (virtualh-y) + 0.5) / (fromIntegral virtualh)
-          virtualw = a * w
-          virtualh = a * h
+calcNDCpoints :: PointFloat -> PointInt -> PointFloat
+calcNDCpoints (x, y) (w, h) = (pixelNDCx, pixelNDCy)
+    where pixelNDCx = (x + 0.5) / (fromIntegral w)
+          pixelNDCy = ((fromIntegral h - y) + 0.5) / (fromIntegral h)
+
+
+generateEyeRaysOrtho :: Transformed Camera -> PointInt -> [Ray]
+generateEyeRaysOrtho c@(Transformed camera matrix _) (x, y) = map (generateEyeRayOrtho c) points
+    where points = generatePoints (x, y) (aaPoints camera)
 
 
 
+generateEyeRayOrtho :: Transformed Camera -> PointFloat -> Ray
+generateEyeRayOrtho (Transformed camera matrix _) (x, y) = Ray transformedOrigin (normalize transformedEyeray)
+    where (x', y') = pointTo3Dpoint camera (x, y)
+          (w, h) = imageSize camera
+          origin = V3 x' y' 0
+          eyeray = V3 0 0 (-1)
+          transformedEyeray = transformDir matrix eyeray
+          transformedOrigin = transformPos matrix origin
+
+generateShadowray :: Hit -> Light -> Ray
+generateShadowray hit light = bias $ Ray (hitPoint hit) (normalize (lightPos light - hitPoint hit))
+
+
+generateReflectionray :: Hit -> Ray -> Ray
+generateReflectionray hit ray = bias $ Ray (hitPoint hit) reflectDir
+    where reflectDir = reflection (direction ray) (hitNorm hit)
+
+
+generateRandomRay :: Hit -> [Float] -> Ray
+generateRandomRay (Hit p n _) [x, y] = Ray p dir
+    where hemisDir = hemisphereDir [x, y]
+          dir = transformRandomDir n hemisDir
+
+
+transformRandomDir :: Direction -> Direction -> Direction
+transformRandomDir (V3 nx ny nz) (V3 x y z) = (V3 a b c)
+    where ((V3 bx by bz), (V3 tx ty tz)) = arbitaryAxis (V3 nx ny nz)
+          a = x * bx + y * nx + z * tx
+          b = x * by + y * ny + z * ty
+          c = x * bz + y * nz + z * tz
+
+
+hemisphereDir :: [Float] -> Direction
+hemisphereDir [a, b] = (V3 x a z)
+    where sinTheta = sqrt (1 - a * a)
+          phi = 2 * pi * b
+          x = sinTheta * cos phi
+          z = sinTheta * sin phi
+
+
+-- hit calculation
 closestHit :: Scene -> Ray -> Maybe Hit
 closestHit scene ray
     | distanceList == [] = Nothing
@@ -221,23 +271,23 @@ closestHit scene ray
 
 
 calcHit :: Ray -> Transformed ShadedObject -> Maybe Hit
-calcHit ray (Transformed (ShadedObject obj material) o2wmat) =
+calcHit ray (Transformed (ShadedObject obj material) o2wmat w2omat) =
     fmap (transformHit o2wmat (transpose w2omat)) $ hit
     where transformedRay = transformRay w2omat ray
-          w2omat = inv44 o2wmat
           hit = intersect transformedRay material obj
 
 
+
+-- renders
 renderPixel :: Scene -> Int -> Int -> PixelRGB8
-renderPixel scene x y = colorToPixel (averageColors colors)
-    where eyerays = generateEyeRays (camera scene) (x, y)
-          colors = map (renderRay scene 0) eyerays
+renderPixel s@(Scene cam _ _ _ _ Perspective) x y = colorToPixel (averageColors colors)
+    where eyerays = generateEyeRays cam (x, y)
+          colors = map (renderRay s 0) eyerays
 
+renderPixel s@(Scene cam _ _ _ _ Orthogonal) x y = colorToPixel (averageColors colors)
+    where eyerays = generateEyeRaysOrtho cam (x, y)
+          colors = map (renderRay s 0) eyerays
 
-averageColors :: [Color] -> Color
-averageColors colors = (V3 (a/l) (b/l) (c/l))
-    where (V3 a b c) = sum colors
-          l = fromIntegral $ length colors
 
 
 renderRay :: Scene -> Int -> Ray -> Color
@@ -249,7 +299,7 @@ renderRay scene depth ray
 
 
 renderRay' :: Scene -> Ray -> Hit -> Int -> Color
-renderRay' scene ray hit depth = clip (diffuse) (0, 1)
+renderRay' scene ray hit depth = clip (diffuse + specular + refraction + reflection) (0, 1)
     where diffuse = renderDiffuse scene hit
           specular = renderSpecular scene hit ray
           refraction = if (kr < 1 && transmission objMaterial > 0)
@@ -262,6 +312,8 @@ renderRay' scene ray hit depth = clip (diffuse) (0, 1)
           objMaterial = material $ hitObj hit
 
 
+
+-- shaders
 renderDiffuse :: Scene -> Hit -> Color
 renderDiffuse scene hit = color material' * intensity' ^* (1 - transmission material')
     where intensity = (brightness $ ambientLight scene) *^ (lightColor $ ambientLight scene)
@@ -309,15 +361,8 @@ renderRefraction scene hit ray depth
           refractionRay = Ray (hitPoint hit)
 
 
-generateShadowray :: Hit -> Light -> Ray
-generateShadowray hit light = bias $ Ray (hitPoint hit) (normalize (lightPos light - hitPoint hit))
 
-
-generateReflectionray :: Hit -> Ray -> Ray
-generateReflectionray hit ray = bias $ Ray (hitPoint hit) reflectDir
-    where reflectDir = reflection (direction ray) (hitNorm hit)
-
-
+-- math & simple utility function
 bias :: Ray -> Ray
 bias (Ray point dir) = Ray newPoint dir
     where newPoint = point + (0.001 *^ dir)
@@ -356,6 +401,15 @@ refraction' cosi n etai etat
     | otherwise = (cosi, (-n), etat, etai)
 
 
+arbitaryAxis :: Direction -> (Position, Position)
+arbitaryAxis norm = (x, y)
+    where n = normalize norm
+          u = if n == V3 1 0 0 then V3 0 1 0 else V3 1 0 0
+          un = dot u n
+          x = normalize (u - un *^ n)
+          y = normalize (cross n x)
+
+
 fresnel :: Direction -> Direction -> Float -> Float
 fresnel indident normal ior
     | sint >= 1 = 1
@@ -384,6 +438,12 @@ colorToPixel (V3 r g b) = PixelRGB8 (to256 r) (to256 g) (to256 b)
     where to256 a = round (255 * a)
 
 
+averageColors :: [Color] -> Color
+averageColors colors = (V3 (a/l) (b/l) (c/l))
+    where (V3 a b c) = sum colors
+          l = fromIntegral $ length colors
+
+
 transformPos :: Matrix44 -> Position -> Position
 transformPos matrix (V3 x y z) = V3 a b c
     where position1 = (V4 x y z 1)
@@ -408,20 +468,18 @@ transformHit matrix transNorm hit = Hit newp newnorm (hitObj hit)
           newnorm = transformDir transNorm (hitNorm hit)
 
 
-getImageX :: Transformed Camera -> Int
-getImageX (Transformed camera matrix) = fst $ imageSize camera
+degreeToRadian :: Float -> Float
+degreeToRadian x = x * pi / 180
 
 
-getImageY :: Transformed Camera -> Int
-getImageY (Transformed camera matrix) = snd $ imageSize camera
+randomNums :: Int -> Hit -> Int -> [[Float]]
+randomNums seed (Hit p n _) num = chunksOf 2 nums
+    where stdGen = mkStdGen (seed * (floor $ dot p n))
+          nums = take (num*2) $ randomRs (0, 1) stdGen
 
 
-imageGenerator :: String -> Scene -> IO ()
-imageGenerator path scene = writePng path $ generateImage (renderPixel scene) x y
-    where x = getImageX $ camera scene
-          y = getImageY $ camera scene
 
-
+-- Transformation
 getTransformMatrix :: [Transformation] -> Matrix44
 getTransformMatrix transList = foldl (!*!) identity matrixList
     where matrixList = map getTransformMatrix' transList
@@ -459,17 +517,31 @@ getTransformMatrix' (Scale (V3 a b c)) = V4 (V4 a 0 0 0)
                                             (V4 0 0 c 0)
                                             (V4 0 0 0 1)
 
-degreeToRadian :: Float -> Float
-degreeToRadian x = x * pi / 180
+
+
+-- generate object/camera/scene
+generateSphere :: Position -> Float -> Material -> Maybe Matrix44 -> Transformed ShadedObject
+generateSphere c r material Nothing = generateTransObj (ShadedObject (Sphere c r) material) identity
+generateSphere c r material (Just m) = generateTransObj (ShadedObject (Sphere c r) material) m
+
+
+generateTransObj :: ShadedObject -> Matrix44 -> Transformed ShadedObject
+generateTransObj obj mat = Transformed obj mat (inv44 mat)
+
+
+generateTransCam :: Camera -> Matrix44 -> Transformed Camera
+generateTransCam obj mat = Transformed obj mat (inv44 mat)
 
 
 generateScene :: Int -> Scene
 generateScene n = Scene { camera = transformedCamera
-                        , objectList = [transformedPlane0]
+                        , objectList = [transformedPlane0, transformedSphere0]
                         , lightList = [light]
                         , defaultColor = V3 0 0 0
                         , ambientLight = ambient
+                        , view = Perspective
                         }
+
     where material0 = Material { color = V3 0.2 0.2 0.2
                              , smoothness = 80
                              , reflectivity = 1
@@ -481,7 +553,7 @@ generateScene n = Scene { camera = transformedCamera
                              , smoothness = 80
                              , reflectivity = 0.8
                              , ior = 1.5
-                             , transmission = 1
+                             , transmission = 0.8
                              }
 
           material2 = Material { color = V3 0.7 0.95 0.95
@@ -497,19 +569,35 @@ generateScene n = Scene { camera = transformedCamera
                              , ior = 1.5
                              , transmission = 0
                              }
+
+          material4 = Material { color = V3 0.1 0.71 0.11
+                             , smoothness = 80
+                             , reflectivity = 0.5
+                             , ior = 1.5
+                             , transmission = 1
+                             }
+
+          checker = Checker material0 material2 (40, 20)
+
           p0 = V3 0 100 0
           p1 = V3 (-80) (-50) (-30)
           p2 = V3 10 (-10) 20
           p3 = V3 90 (-40) (-40)
+
+          transformedSphere0 = generateSphere (V3 0 0 0) 150 checker (Just stretchMatrix)
+
+          transformedSphere1 = generateSphere (V3 130 (-30) (-300)) 60 material4 Nothing
+
+          transformedSphere2 = generateSphere (V3 (-120) (-10) (-220)) 80 material1 Nothing
+
           plane0 = Plane (V3 0 (-100) 0) (V3 0 1 0) False
-          board = CheckerBoard (V3 0 (-100) 0) (V3 0 1 0) False material0 material2 80
           tetrahedron = CompositeTriangle [p0, p1, p2, p3] [0, 1, 2, 0, 2, 3, 0, 3, 1, 2, 1, 3]
           identityMatrix = identity :: M44 Float
-          stretchMatrix = getTransformMatrix [(Translate (V3 0 0 (-200))), (Rotate Y ((fromIntegral n) * 12))]
-          shadedPlane0 = ShadedObject { shadeObj = board, material = material2 }
-          transformedPlane0 = Transformed shadedPlane0 identityMatrix
+          stretchMatrix = getTransformMatrix [(Translate (V3 0 100 (-400))), (Rotate Y ((fromIntegral n) * 12))]
+          shadedPlane0 = ShadedObject { shadeObj = plane0, material = material2 }
+          transformedPlane0 = generateTransObj shadedPlane0 identityMatrix
           shadedTetra = ShadedObject { shadeObj = tetrahedron, material = material3 }
-          transformedTetra = Transformed shadedTetra stretchMatrix
+          transformedTetra = generateTransObj shadedTetra stretchMatrix
           light = Light { lightPos = V3 (-100) 400 0
                         , brightness = 1
                         , lightColor = V3 1 1 1
@@ -518,14 +606,28 @@ generateScene n = Scene { camera = transformedCamera
                         , brightness = 0.1
                         , lightColor = V3 1 1 1
                         }
-          mycamera = Camera { cameraPos = V3 0 0 0
-                        , focalLength = 15
-                        , cameraAperture = (36, 24)
-                        , imageSize = (600, 400)
-                        , aaFactor = 2
-                        }
-          transformedCamera = Transformed mycamera identityMatrix
+          mycamera = Camera {focalLength = 15
+                            , cameraAperture = (36, 24)
+                            , imageSize = (1200, 800)
+                            , aaPoints = [((-0.2), 0.2), (0.3, 0.1), ((-0.1), (-0.3))]
+                            }
+          transformedCamera = generateTransCam mycamera identityMatrix
 
+
+
+-- image related
+getImageX :: Transformed Camera -> Int
+getImageX (Transformed camera matrix _) = fst $ imageSize camera
+
+
+getImageY :: Transformed Camera -> Int
+getImageY (Transformed camera matrix _) = snd $ imageSize camera
+
+
+imageGenerator :: String -> Scene -> IO ()
+imageGenerator path scene = writePng path $ generateImage (renderPixel scene) x y
+    where x = getImageX $ camera scene
+          y = getImageY $ camera scene
 
 serialImageGenerator :: Int -> IO()
 serialImageGenerator n = imageGenerator path scene
